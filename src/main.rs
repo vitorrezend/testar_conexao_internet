@@ -228,6 +228,7 @@ async fn main() -> Result<()> {
                 if event.id == show_gui_id {
                     if let Some(ctx) = &egui_ctx {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                 } else if event.id == show_hide_id {
