@@ -1,0 +1,17 @@
+[package]
+name = "testar_internet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+chrono = "0.4"
+local_ipaddress = "0.1"
+network-interface = "1.1"
+anyhow = "1.0"
+dns-lookup = "2.0"
+tray-icon = "0.19"
+tao = "0.30"
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
+image = "0.25"
