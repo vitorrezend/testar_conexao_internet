@@ -1,35 +1,35 @@
-# Internet Stability Monitor (Rust)
+# Monitor de Estabilidade de Internet (Rust)
 
-A lightweight Rust application to monitor network stability by pinging multiple endpoints, tracking latency, DNS resolution, and network context (IP/SSID).
+Uma aplicação leve em Rust para monitorar a estabilidade da rede testando múltiplos endpoints, acompanhando latência, resolução de DNS e contexto de rede (IP/SSID).
 
-## Features
-- **Daily Log Organization**: Logs are automatically organized into folders by date (e.g., `2026-02-10/`).
-- **Granular Diagnostics**:
-    - `connectivity.txt`: HTTP RTT, DNS resolution time, and direct IP connectivity.
-    - `network_context.txt`: Internal IP, Gateway, External IP, and Wi-Fi SSID.
-    - `incidents.txt`: Dedicated log for outages and recovery with duration tracking.
-- **Stealth Mode**: Starts hidden in the system tray (notification area).
-- **System Tray Integration**:
-    - Toggle console visibility.
-    - Quick access to log folders.
-    - Persistent monitoring in the background.
+## Funcionalidades
+- **Organização de Logs Diários**: Os logs são organizados automaticamente em pastas por data (ex: `2026-02-10/`).
+- **Diagnósticos Detalhados**:
+    - `connectivity.txt`: RTT HTTP, tempo de resolução DNS e conectividade direta por IP.
+    - `network_context.txt`: IP Interno, Gateway, IP Externo e SSID do Wi-Fi.
+    - `incidents.txt`: Log dedicado para quedas e restaurações com rastreamento de duração.
+- **Modo Silencioso**: Inicia oculto na bandeja do sistema (área de notificação).
+- **Integração com a Bandeja (Tray)**:
+    - Alternar visibilidade do console.
+    - Acesso rápido às pastas de logs.
+    - Monitoramento persistente em segundo plano.
 
-## How to Run
-1. Ensure you have Rust installed.
-2. Clone the repository.
-3. Run with:
+## Como Executar
+1. Certifique-se de ter o Rust instalado.
+2. Clone o repositório.
+3. Execute com:
    ```bash
    cargo run
    ```
-4. For the optimized production version:
+4. Para a versão de produção otimizada:
    ```bash
    cargo build --release
    ```
-   The executable will be in `target/release/testar_internet.exe`.
+   O executável estará em `target/release/testar_internet.exe`.
 
-## Dependencies
-- `tokio`: Async runtime.
-- `reqwest`: HTTP client for tests and external IP discovery.
-- `tray-icon` & `tao`: System tray and event loop management.
-- `windows-sys`: Windows API for window management.
-- `chrono`: Daily rotation and timestamping.
+## Dependências
+- `tokio`: Runtime assíncrono.
+- `reqwest`: Cliente HTTP para testes e descoberta de IP externo.
+- `tray-icon` & `tao`: Gerenciamento da bandeja do sistema e loop de eventos.
+- `windows-sys`: API do Windows para gerenciamento de janelas.
+- `chrono`: Rotação diária e data/hora.
