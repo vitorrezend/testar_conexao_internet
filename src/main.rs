@@ -135,6 +135,12 @@ impl eframe::App for MonitorApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         });
+        
+        // Minimize to Tray logic
+        if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false)); // Reset minimized state so it can be restored open
+        }
 
         // Request a redraw to keep stats updated
         ctx.request_repaint_after(TokioDuration::from_millis(500));
@@ -205,12 +211,25 @@ async fn main() -> Result<()> {
     let quit_id = quit_item.id().clone();
 
     // Thread to handle tray events
+    let (ctx_tx, ctx_rx) = std::sync::mpsc::channel::<egui::Context>();
     tokio::spawn(async move {
         let mut console_visible = false;
+        let mut egui_ctx: Option<egui::Context> = None;
+        
         loop {
+            // Try to get the context if not already present
+            if egui_ctx.is_none() {
+                if let Ok(ctx) = ctx_rx.try_recv() {
+                    egui_ctx = Some(ctx);
+                }
+            }
+
             if let Ok(event) = menu_channel.try_recv() {
                 if event.id == show_gui_id {
-                    // Restore GUI visibility logic here if needed
+                    if let Some(ctx) = &egui_ctx {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                 } else if event.id == show_hide_id {
                     console_visible = !console_visible;
                     set_console_visibility(console_visible);
@@ -227,7 +246,10 @@ async fn main() -> Result<()> {
     eframe::run_native(
         "Monitor de Conexão",
         options,
-        Box::new(|_cc| Ok(Box::new(MonitorApp::new(gui_state, config)))),
+        Box::new(move |cc| {
+            let _ = ctx_tx.send(cc.egui_ctx.clone());
+            Ok(Box::new(MonitorApp::new(gui_state, config)))
+        }),
     ).map_err(|e| anyhow!("GUI Error: {}", e))?;
 
     Ok(())
