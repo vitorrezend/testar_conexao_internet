@@ -7,15 +7,59 @@ use std::io::Write;
 use std::process::Command;
 use std::time::Instant;
 use tokio::time::{sleep, Duration as TokioDuration};
+use std::sync::{Arc, Mutex};
 
-// Tray and UI imports
+// GUI and Tray imports
+use eframe::egui;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     TrayIconBuilder, Icon,
 };
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
 use windows_sys::Win32::System::Console::GetConsoleWindow;
+use ini::Ini;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AppConfig {
+    target_host: String,
+    auto_start: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            target_host: "www.google.com".to_string(),
+            auto_start: true,
+        }
+    }
+}
+
+impl AppConfig {
+    fn load() -> Self {
+        if let Ok(conf) = Ini::load_from_file("config.ini") {
+            let section = conf.section(Some("Settings"));
+            let target_host = section.and_then(|s| s.get("target_host"))
+                .unwrap_or("www.google.com")
+                .to_string();
+            let auto_start = section.and_then(|s| s.get("auto_start"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(true);
+            Self { target_host, auto_start }
+        } else {
+            let conf = Self::default();
+            conf.save();
+            conf
+        }
+    }
+
+    fn save(&self) {
+        let mut conf = Ini::new();
+        conf.with_section(Some("Settings"))
+            .set("target_host", &self.target_host)
+            .set("auto_start", self.auto_start.to_string());
+        let _ = conf.write_to_file("config.ini");
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct NetworkContext {
@@ -31,89 +75,164 @@ struct IncidentTracker {
     last_incidents: Vec<DateTime<Local>>,
 }
 
+struct MonitorState {
+    is_running: bool,
+    target_host: String,
+    current_rtt: u128,
+    current_ssid: String,
+    current_status: String,
+}
+
+struct MonitorApp {
+    state: Arc<Mutex<MonitorState>>,
+    config: AppConfig,
+}
+
+impl MonitorApp {
+    fn new(state: Arc<Mutex<MonitorState>>, config: AppConfig) -> Self {
+        Self { state, config }
+    }
+}
+
+impl eframe::App for MonitorApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut state_lock = self.state.lock().unwrap();
+        
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Monitor de Estabilidade de Internet");
+            ui.add_space(10.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Alvo do Teste:");
+                if ui.text_edit_singleline(&mut self.config.target_host).changed() {
+                    state_lock.target_host = self.config.target_host.clone();
+                    self.config.save();
+                }
+            });
+
+            ui.add_space(5.0);
+
+            ui.horizontal(|ui| {
+                if ui.button(if state_lock.is_running { "Parar Teste" } else { "Iniciar Teste" }).clicked() {
+                    state_lock.is_running = !state_lock.is_running;
+                }
+
+                if ui.checkbox(&mut self.config.auto_start, "Iniciar automaticamente").changed() {
+                    self.config.save();
+                }
+            });
+
+            ui.separator();
+
+            ui.label(format!("Status: {}", state_lock.current_status));
+            ui.label(format!("Latência: {}ms", state_lock.current_rtt));
+            ui.label(format!("Rede/SSID: {}", state_lock.current_ssid));
+            
+            ui.add_space(10.0);
+            if ui.button("Fechar para a Tray").clicked() {
+                set_console_visibility(false);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        });
+
+        // Request a redraw to keep stats updated
+        ctx.request_repaint_after(TokioDuration::from_millis(500));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 0. Hide console immediately for stealth startup
+    // 0. Initial Setup
+    let config = AppConfig::load();
+    let state = Arc::new(Mutex::new(MonitorState {
+        is_running: config.auto_start,
+        target_host: config.target_host.clone(),
+        current_rtt: 0,
+        current_ssid: "Iniciando...".to_string(),
+        current_status: "Aguardando...".to_string(),
+    }));
+
+    // Hide console by default
     set_console_visibility(false);
 
     // 1. Setup Tray Menu
     let tray_menu = Menu::new();
+    let show_gui_item = MenuItem::new("Abrir Interface", true, None);
     let show_hide_item = MenuItem::new("Mostrar/Esconder Console", true, None);
     let open_logs_item = MenuItem::new("Abrir Pasta de Logs", true, None);
     let quit_item = MenuItem::new("Sair", true, None);
 
     tray_menu.append_items(&[
+        &show_gui_item,
         &show_hide_item,
         &open_logs_item,
         &PredefinedMenuItem::separator(),
         &quit_item,
     ])?;
 
-    // 2. Create Icon (32x32 Green dot)
+    // 2. Initialize Tray Icon
     let icon = create_simple_icon();
-
-    // 3. Initialize Tray Icon
     let _tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_tooltip("Monitor de Internet")
         .with_icon(icon)
         .build()?;
 
-    // 4. Spawn Monitoring Loop
+    // 3. Spawn Monitoring Loop
+    let monitor_state = Arc::clone(&state);
     tokio::spawn(async move {
-        if let Err(e) = run_monitor().await {
+        if let Err(e) = run_monitor(monitor_state).await {
             eprintln!("Monitor Erro: {}", e);
         }
     });
 
-    // 5. Run GUI Event Loop (tao)
-    let event_loop = EventLoopBuilder::new().build();
+    // 4. GUI Event Handling (Tray Events)
     let menu_channel = MenuEvent::receiver();
-    let mut console_visible = false; // Initial state matches step 0
+    
+    let gui_state = Arc::clone(&state);
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([400.0, 300.0])
+            .with_title("Monitor de Conexão"),
+        ..Default::default()
+    };
 
-    event_loop.run(move |_event, _, control_flow| {
-        *control_flow = ControlFlow::Poll;
+    // Capture IDs as strings to be Send-safe
+    let show_gui_id = show_gui_item.id().clone();
+    let show_hide_id = show_hide_item.id().clone();
+    let open_logs_id = open_logs_item.id().clone();
+    let quit_id = quit_item.id().clone();
 
-        if let Ok(event) = menu_channel.try_recv() {
-            if event.id == show_hide_item.id() {
-                console_visible = !console_visible;
-                set_console_visibility(console_visible);
-            } else if event.id == open_logs_item.id() {
-                let _ = Command::new("explorer").arg(".").spawn();
-            } else if event.id == quit_item.id() {
-                *control_flow = ControlFlow::Exit;
+    // Thread to handle tray events
+    tokio::spawn(async move {
+        let mut console_visible = false;
+        loop {
+            if let Ok(event) = menu_channel.try_recv() {
+                if event.id == show_gui_id {
+                    // Restore GUI visibility logic here if needed
+                } else if event.id == show_hide_id {
+                    console_visible = !console_visible;
+                    set_console_visibility(console_visible);
+                } else if event.id == open_logs_id {
+                    let _ = Command::new("explorer").arg(".").spawn();
+                } else if event.id == quit_id {
+                    std::process::exit(0);
+                }
             }
+            sleep(TokioDuration::from_millis(100)).await;
         }
     });
+
+    eframe::run_native(
+        "Monitor de Conexão",
+        options,
+        Box::new(|_cc| Ok(Box::new(MonitorApp::new(gui_state, config)))),
+    ).map_err(|e| anyhow!("GUI Error: {}", e))?;
+
+    Ok(())
 }
 
-fn set_console_visibility(visible: bool) {
-    unsafe {
-        let hwnd = GetConsoleWindow();
-        if !hwnd.is_null() {
-            ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
-        }
-    }
-}
-
-fn create_simple_icon() -> Icon {
-    let width = 32;
-    let height = 32;
-    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-    for y in 0..height {
-        for x in 0..width {
-            let dist = (((x as i32 - 16).pow(2) + (y as i32 - 16).pow(2)) as f32).sqrt();
-            if dist < 12.0 {
-                rgba.extend_from_slice(&[0, 180, 0, 255]); // Green dot
-            } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]); // Transparent
-            }
-        }
-    }
-    Icon::from_rgba(rgba, width, height).expect("Falha ao criar ícone")
-}
-
-async fn run_monitor() -> Result<()> {
+async fn run_monitor(state: Arc<Mutex<MonitorState>>) -> Result<()> {
     let client = Client::builder()
         .tcp_keepalive(Some(TokioDuration::from_secs(60)))
         .timeout(TokioDuration::from_secs(2))
@@ -138,22 +257,29 @@ async fn run_monitor() -> Result<()> {
         Local::now().format("%Y-%m-%d %H:%M:%S")
     ));
 
-    println!("--- Monitor de Estabilidade de Internet (v2) Ativo ---");
-    println!("DICA: Use o ícone na bandeja para esconder esta janela.");
-    println!("AVISO: Clicar no 'X' desta janela fechará o programa permanentemente.");
-    println!("---------------------------------------------------------");
-
     loop {
+        let (running, target) = {
+            let s = state.lock().unwrap();
+            (s.is_running, s.target_host.clone())
+        };
+
+        if !running {
+            sleep(TokioDuration::from_millis(500)).await;
+            continue;
+        }
+
         let now = Local::now();
         
         // 1. Connectivity Tests
         let dns_start = Instant::now();
-        let dns_res = lookup_host("www.google.com");
+        let dns_res = lookup_host(&target);
         let dns_status = if dns_res.is_ok() { "OK" } else { "FAIL" };
         let dns_time = dns_start.elapsed().as_millis();
 
         let http_start = Instant::now();
-        let http_res = client.head("https://www.google.com").send().await;
+        let url = if target.starts_with("http") { target.clone() } else { format!("https://{}", target) };
+        let http_res = client.head(&url).send().await;
+        
         let (http_status, http_code, http_rtt) = match http_res {
             Ok(resp) => ("OK", resp.status().as_u16().to_string(), http_start.elapsed().as_millis()),
             Err(e) => ("FAIL", format!("{:?}", e.status().map(|s| s.as_u16()).unwrap_or(0)), 0),
@@ -163,6 +289,14 @@ async fn run_monitor() -> Result<()> {
         let ip_direct_status = if ip_direct_res.is_ok() { "OK" } else { "FAIL" };
 
         let is_up = http_status == "OK";
+
+        // Update state for GUI
+        {
+            let mut s = state.lock().unwrap();
+            s.current_rtt = http_rtt;
+            s.current_ssid = ctx.wifi_ssid.clone();
+            s.current_status = if is_up { "Online".to_string() } else { "Offline".to_string() };
+        }
 
         // 2. Network Context (Check for changes every 10 seconds or on recovery)
         if now.second() % 10 == 0 || (is_up && tracker.last_outage_start.is_some()) {
@@ -296,4 +430,30 @@ fn log_to_file(filename: &str, message: &str) {
     if let Err(e) = file.sync_all() {
         eprintln!("Erro ao sincronizar arquivo {:?} com o disco: {}", path, e);
     }
+}
+
+fn set_console_visibility(visible: bool) {
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if !hwnd.is_null() {
+            ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+        }
+    }
+}
+
+fn create_simple_icon() -> Icon {
+    let width = 32;
+    let height = 32;
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let dist = (((x as i32 - 16).pow(2) + (y as i32 - 16).pow(2)) as f32).sqrt();
+            if dist < 12.0 {
+                rgba.extend_from_slice(&[0, 180, 0, 255]); // Green dot
+            } else {
+                rgba.extend_from_slice(&[0, 0, 0, 0]); // Transparent
+            }
+        }
+    }
+    Icon::from_rgba(rgba, width, height).expect("Falha ao criar ícone")
 }
