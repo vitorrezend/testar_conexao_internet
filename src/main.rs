@@ -338,8 +338,8 @@ async fn run_monitor(state: Arc<Mutex<MonitorState>>) -> Result<()> {
 
         // 4. Detailed Connectivity Log
         log_to_file("connectivity.txt", &format!(
-            "[{}] HTTP:{} (Code:{}, RTT:{}ms) | DNS:{} ({}ms) | IP_Direct:{}",
-            now.format("%Y-%m-%d %H:%M:%S"), http_status, http_code, http_rtt, dns_status, dns_time, ip_direct_status
+            "[{}] Alvo:{} | HTTP:{} (Code:{}, RTT:{}ms) | DNS:{} ({}ms) | IP_Direct:{}",
+            now.format("%Y-%m-%d %H:%M:%S"), target, http_status, http_code, http_rtt, dns_status, dns_time, ip_direct_status
         ));
 
         // Console output
