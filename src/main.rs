@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Duration as ChronoDuration, Local, Timelike};
+use chrono::{DateTime, Duration as ChronoDuration, Local};
 use dns_lookup::lookup_host;
 use reqwest::Client;
 use std::fs::OpenOptions;
@@ -73,6 +73,7 @@ struct IncidentTracker {
     last_outage_start: Option<DateTime<Local>>,
     instability_count: usize,
     last_incidents: Vec<DateTime<Local>>,
+    last_check: Instant,
 }
 
 struct MonitorState {
@@ -219,7 +220,7 @@ async fn main() -> Result<()> {
                     std::process::exit(0);
                 }
             }
-            sleep(TokioDuration::from_millis(100)).await;
+            sleep(TokioDuration::from_millis(250)).await;
         }
     });
 
@@ -243,6 +244,7 @@ async fn run_monitor(state: Arc<Mutex<MonitorState>>) -> Result<()> {
         last_outage_start: None,
         instability_count: 0,
         last_incidents: Vec::new(),
+        last_check: Instant::now(),
     };
 
     // Log Initial Context
@@ -298,8 +300,9 @@ async fn run_monitor(state: Arc<Mutex<MonitorState>>) -> Result<()> {
             s.current_status = if is_up { "Online".to_string() } else { "Offline".to_string() };
         }
 
-        // 2. Network Context (Check for changes every 10 seconds or on recovery)
-        if now.second() % 10 == 0 || (is_up && tracker.last_outage_start.is_some()) {
+        // 2. Network Context (Smart frequency: 30s when online, 1s when offline)
+        let context_interval = if is_up { 30 } else { 1 };
+        if tracker.last_check.elapsed().as_secs() >= context_interval || (is_up && tracker.last_outage_start.is_some()) {
             let new_ctx = get_network_context(&client).await;
             if new_ctx != ctx {
                 log_to_file("network_context.txt", &format!(
@@ -308,6 +311,7 @@ async fn run_monitor(state: Arc<Mutex<MonitorState>>) -> Result<()> {
                 ));
                 ctx = new_ctx;
             }
+            tracker.last_check = Instant::now();
         }
 
         // 3. Incident Logic
@@ -372,21 +376,8 @@ async fn get_network_context(client: &Client) -> NetworkContext {
 }
 
 fn get_windows_gateway() -> Result<String> {
-    let output = Command::new("ipconfig").output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut found_gateway = None;
-    
-    for line in stdout.lines() {
-        if line.contains("Default Gateway") || line.contains("Gateway Padrão") {
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() > 1 && !parts[1].trim().is_empty() {
-                found_gateway = Some(parts[1].trim().to_string());
-                break;
-            }
-        }
-    }
-    
-    found_gateway.ok_or_else(|| anyhow!("Gateway não encontrado"))
+    let default_gateway = default_net::get_default_gateway().map_err(|e| anyhow!(e))?;
+    Ok(default_gateway.ip_addr.to_string())
 }
 
 fn get_windows_ssid() -> Result<String> {
@@ -425,10 +416,6 @@ fn log_to_file(filename: &str, message: &str) {
     
     if let Err(e) = writeln!(file, "{}", message) {
         eprintln!("Erro ao escrever no arquivo {:?}: {}", path, e);
-    }
-    
-    if let Err(e) = file.sync_all() {
-        eprintln!("Erro ao sincronizar arquivo {:?} com o disco: {}", path, e);
     }
 }
 
