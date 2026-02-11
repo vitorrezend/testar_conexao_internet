@@ -143,8 +143,8 @@ impl eframe::App for MonitorApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false)); // Reset minimized state
         }
 
-        // Request a redraw to keep stats updated
-        ctx.request_repaint_after(TokioDuration::from_millis(500));
+        // No automatic repaint timer here to save CPU. 
+        // Repaint is triggered by the monitor thread or user interaction.
     }
 }
 
@@ -186,13 +186,7 @@ async fn main() -> Result<()> {
         .with_icon(icon)
         .build()?;
 
-    // 3. Spawn Monitoring Loop
-    let monitor_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        if let Err(e) = run_monitor(monitor_state).await {
-            eprintln!("Monitor Erro: {}", e);
-        }
-    });
+    // 3. (Spawn Monitoring Loop - moved to eframe init)
 
     // 4. GUI Event Handling (Tray Events)
     let menu_channel = MenuEvent::receiver();
@@ -215,12 +209,12 @@ async fn main() -> Result<()> {
     let (ctx_tx, ctx_rx) = std::sync::mpsc::channel::<egui::Context>();
     let tray_channel = TrayIconEvent::receiver();
 
-    tokio::spawn(async move {
+    // Use a standard thread for tray events to avoid tokio runtime overhead for polling
+    std::thread::spawn(move || {
         let mut console_visible = false;
         let mut egui_ctx: Option<egui::Context> = None;
         
         loop {
-            // Try to get the context if not already present
             if egui_ctx.is_none() {
                 if let Ok(ctx) = ctx_rx.try_recv() {
                     egui_ctx = Some(ctx);
@@ -229,14 +223,15 @@ async fn main() -> Result<()> {
 
             let mut needs_restore = false;
 
-            // Handle Menu Events
+            // Use a small timeout to "select" between channels without busy looping
+            // MenuEvent and TrayIconEvent use crossbeam-channel internally, but expose them via standard receiver()
+            // We'll use try_recv and a longer sleep to keep it simple and CPU-friendly
             if let Ok(event) = menu_channel.try_recv() {
                 if event.id == show_gui_id {
                     needs_restore = true;
                 } else if event.id == show_hide_id {
                     console_visible = !console_visible;
                     set_console_visibility(console_visible);
-                    // Also restore GUI when toggling console as requested
                     needs_restore = true;
                 } else if event.id == open_logs_id {
                     let _ = Command::new("explorer").arg(".").spawn();
@@ -245,7 +240,6 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Handle Tray Icon Events (Click to restore)
             if let Ok(event) = tray_channel.try_recv() {
                 match event {
                     TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. } => {
@@ -262,19 +256,29 @@ async fn main() -> Result<()> {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.request_repaint();
                 }
-                // Native fallback for Windows 11
                 force_window_restore("Monitor de Conexão");
             }
 
-            sleep(TokioDuration::from_millis(50)).await;
+            std::thread::sleep(TokioDuration::from_millis(200));
         }
     });
+
 
     eframe::run_native(
         "Monitor de Conexão",
         options,
         Box::new(move |cc| {
-            let _ = ctx_tx.send(cc.egui_ctx.clone());
+            let ctx = cc.egui_ctx.clone();
+            let _ = ctx_tx.send(ctx.clone());
+            
+            // Spawn Monitoring Loop here to give it the context
+            let monitor_state = Arc::clone(&gui_state);
+            tokio::spawn(async move {
+                if let Err(e) = run_monitor(monitor_state, ctx).await {
+                    eprintln!("Monitor Erro: {}", e);
+                }
+            });
+
             Ok(Box::new(MonitorApp::new(gui_state, config)))
         }),
     ).map_err(|e| anyhow!("GUI Error: {}", e))?;
@@ -282,13 +286,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_monitor(state: Arc<Mutex<MonitorState>>) -> Result<()> {
+async fn run_monitor(state: Arc<Mutex<MonitorState>>, ctx_gui: egui::Context) -> Result<()> {
     let client = Client::builder()
         .tcp_keepalive(Some(TokioDuration::from_secs(60)))
         .timeout(TokioDuration::from_secs(2))
         .build()?;
 
-    let mut ctx = get_network_context(&client).await;
+    let mut current_ctx = get_network_context(&client).await;
     let mut tracker = IncidentTracker {
         last_outage_start: None,
         instability_count: 0,
@@ -299,7 +303,7 @@ async fn run_monitor(state: Arc<Mutex<MonitorState>>) -> Result<()> {
     // Log Initial Context
     log_to_file("network_context.txt", &format!(
         "[{}] INÍCIO: Int:{} | GW:{} | Ext:{} | SSID:{}",
-        Local::now().format("%Y-%m-%d %H:%M:%S"), ctx.internal_ip, ctx.gateway, ctx.external_ip, ctx.wifi_ssid
+        Local::now().format("%Y-%m-%d %H:%M:%S"), current_ctx.internal_ip, current_ctx.gateway, current_ctx.external_ip, current_ctx.wifi_ssid
     ));
 
     // Log Session Start in Incidents
@@ -345,20 +349,23 @@ async fn run_monitor(state: Arc<Mutex<MonitorState>>) -> Result<()> {
         {
             let mut s = state.lock().unwrap();
             s.current_rtt = http_rtt;
-            s.current_ssid = ctx.wifi_ssid.clone();
+            s.current_ssid = current_ctx.wifi_ssid.clone();
             s.current_status = if is_up { "Online".to_string() } else { "Offline".to_string() };
         }
+        
+        // Trigger GUI repaint
+        ctx_gui.request_repaint();
 
         // 2. Network Context (Smart frequency: 30s when online, 1s when offline)
         let context_interval = if is_up { 30 } else { 1 };
         if tracker.last_check.elapsed().as_secs() >= context_interval || (is_up && tracker.last_outage_start.is_some()) {
             let new_ctx = get_network_context(&client).await;
-            if new_ctx != ctx {
+            if new_ctx != current_ctx {
                 log_to_file("network_context.txt", &format!(
                     "[{}] MUDANÇA: Int:{} | GW:{} | Ext:{} | SSID:{}",
                     now.format("%Y-%m-%d %H:%M:%S"), new_ctx.internal_ip, new_ctx.gateway, new_ctx.external_ip, new_ctx.wifi_ssid
                 ));
-                ctx = new_ctx;
+                current_ctx = new_ctx;
             }
             tracker.last_check = Instant::now();
         }
@@ -393,7 +400,7 @@ async fn run_monitor(state: Arc<Mutex<MonitorState>>) -> Result<()> {
 
         // Console output
         if is_up {
-            print!("\r[{}] Status: OK | RTT: {}ms | SSID: {}          ", now.format("%H:%M:%S"), http_rtt, ctx.wifi_ssid);
+            print!("\r[{}] Status: OK | RTT: {}ms | SSID: {}          ", now.format("%H:%M:%S"), http_rtt, current_ctx.wifi_ssid);
             let _ = std::io::stdout().flush();
         } else {
             println!("\n[{}] !!! SEM CONEXÃO !!! | HTTP: {} | DNS: {} | IP: {}", 
