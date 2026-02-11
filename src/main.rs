@@ -13,11 +13,12 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    TrayIconBuilder, Icon,
+    TrayIconBuilder, Icon, TrayIconEvent,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
+use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW, SW_RESTORE, FindWindowW, SetForegroundWindow};
 use windows_sys::Win32::System::Console::GetConsoleWindow;
 use ini::Ini;
+use std::os::windows::ffi::OsStrExt;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct AppConfig {
@@ -139,7 +140,7 @@ impl eframe::App for MonitorApp {
         // Minimize to Tray logic
         if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false)); // Reset minimized state so it can be restored open
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false)); // Reset minimized state
         }
 
         // Request a redraw to keep stats updated
@@ -212,6 +213,8 @@ async fn main() -> Result<()> {
 
     // Thread to handle tray events
     let (ctx_tx, ctx_rx) = std::sync::mpsc::channel::<egui::Context>();
+    let tray_channel = TrayIconEvent::receiver();
+
     tokio::spawn(async move {
         let mut console_visible = false;
         let mut egui_ctx: Option<egui::Context> = None;
@@ -224,23 +227,46 @@ async fn main() -> Result<()> {
                 }
             }
 
+            let mut needs_restore = false;
+
+            // Handle Menu Events
             if let Ok(event) = menu_channel.try_recv() {
                 if event.id == show_gui_id {
-                    if let Some(ctx) = &egui_ctx {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
+                    needs_restore = true;
                 } else if event.id == show_hide_id {
                     console_visible = !console_visible;
                     set_console_visibility(console_visible);
+                    // Also restore GUI when toggling console as requested
+                    needs_restore = true;
                 } else if event.id == open_logs_id {
                     let _ = Command::new("explorer").arg(".").spawn();
                 } else if event.id == quit_id {
                     std::process::exit(0);
                 }
             }
-            sleep(TokioDuration::from_millis(250)).await;
+
+            // Handle Tray Icon Events (Click to restore)
+            if let Ok(event) = tray_channel.try_recv() {
+                match event {
+                    TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. } => {
+                        needs_restore = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            if needs_restore {
+                if let Some(ctx) = &egui_ctx {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.request_repaint();
+                }
+                // Native fallback for Windows 11
+                force_window_restore("Monitor de Conexão");
+            }
+
+            sleep(TokioDuration::from_millis(50)).await;
         }
     });
 
@@ -439,6 +465,22 @@ fn log_to_file(filename: &str, message: &str) {
     
     if let Err(e) = writeln!(file, "{}", message) {
         eprintln!("Erro ao escrever no arquivo {:?}: {}", path, e);
+    }
+}
+
+fn force_window_restore(title: &str) {
+    unsafe {
+        let title_wide: Vec<u16> = std::ffi::OsStr::new(title)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        
+        let hwnd = FindWindowW(std::ptr::null(), title_wide.as_ptr());
+        if !hwnd.is_null() {
+            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+        }
     }
 }
 
